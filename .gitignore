@@ -1,0 +1,33 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.Python
+
+# ---- PyInstaller / 构建产物 ----
+build/
+dist/
+*.spec.bak
+manifest_*.json
+
+# ---- 运行期产物 ----
+logs/
+backups/
+*.log
+*.bin
+!jl-uboot-tool/data/loaderblobs/**/*.bin
+
+# ---- 第三方固件包（版权归原厂商，不随仓库发布）----
+固件包*/
+固件包_ebook_V0.6.3/
+
+# ---- 环境/编辑器 ----
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
