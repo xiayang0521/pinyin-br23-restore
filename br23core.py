@@ -24,6 +24,7 @@ br23core —— 杰理 BR23 / AC6956C 固件备份与恢复核心库
 import hashlib
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 FLASH_SIZE = 0x100000          # 1MB 内置 NOR Flash
@@ -33,6 +34,13 @@ MAX_CHUNK = 256                # BR23 loader I/O 缓冲（实测 256 最稳）
 READ_RETRY = 3
 WRITE_RETRY = 3
 LOADER_ARG = 0x0001            # target=1(SPI NOR) | clkdiv=0 | spimode=0(3-wire)
+
+# jl_isd.bin 是配合杰理烧录工具生成的“一体化固件”：头部为 ISD 封装/段表，
+# 内部 uboot/app 等段已加密。真机实测它从物理地址 0x1000 起逐字节裸放
+# （头部魔数恰在 0x1000，isd_config.ini 的 EOFFSET=1 佐证），故复用
+# LOADER_END 作为落盘起点；刷写只动这个窗口，boot 区与其后的资源区不碰。
+ISD_BASE = LOADER_END
+ISD_MAGIC = bytes.fromhex("46e4bf1d")   # jl_isd 头部 4 字节魔数（真机锚点）
 
 JL_PRODUCTS = ("UBOOT", "UDISK", "DEVICE")
 DEV_TYPE = {
@@ -365,6 +373,47 @@ class Device:
         self.log(f"  整片回读完成：{len(data)} 字节，耗时 {time.time() - t0:.1f} 秒")
         return bytes(data)
 
+    # ---------------- 窗口读取（jl_isd 专用，避免读取整片 1MB） ----------------
+
+    def _read_retry(self, addr, size):
+        """读取指定地址区间，带 READ_RETRY 次重试。失败抛出 RuntimeError。
+
+        抽成独立方法是因为整片回读与 jl_isd 窗口回读共用同一套重试规则，
+        避免在两处重复实现异常处理。
+        """
+        got = None
+        for attempt in range(1, READ_RETRY + 1):
+            try:
+                got = self.ldr.flash_read(addr, size)
+                break
+            except Exception as e:
+                if attempt == READ_RETRY:
+                    raise RuntimeError(
+                        f"回读 0x{addr:06X} 失败（重试 {READ_RETRY} 次）: "
+                        f"{type(e).__name__}: {e}") from e
+                self.log(f"  回读 0x{addr:06X} 第 {attempt} 次失败"
+                         f"（{type(e).__name__}），重试...")
+                time.sleep(0.4)
+        return got
+
+    def read_window(self, base, size, progress=None):
+        """只读回读 [base, base+size) 区间。jl_isd 只需这一小段，不必读全片。"""
+        chunk = self.chunk_size()
+        self.log(f"  回读窗口 0x{base:X} - 0x{base + size:X}"
+                 f"（{size // 1024} KB，块 {chunk} 字节）...")
+        data = bytearray()
+        addr = base
+        t0 = time.time()
+        while addr < base + size:
+            n = min(chunk, base + size - addr)
+            data += self._read_retry(addr, n)
+            addr += n
+            if progress:
+                progress((addr - base) * 100 // size)
+        self.log(f"  窗口回读完成：{len(data)} 字节，"
+                 f"耗时 {time.time() - t0:.1f} 秒")
+        return bytes(data)
+
     # ---------------- 写入 ----------------
 
     def write_sector(self, addr, data):
@@ -388,14 +437,19 @@ class Device:
             self.log(f"  扇区 0x{addr:06X} 写入异常: {type(e).__name__}: {e}")
             return False
 
-    def write_plan(self, image, plan_addrs, progress=None):
-        """按 plan_addrs 列表逐扇区写入。返回 (成功?, 剩余未完成列表)"""
+    def write_plan(self, image, plan_addrs, progress=None, base=0):
+        """按 plan_addrs 列表逐扇区写入。返回 (成功?, 剩余未完成列表)
+
+        base 为 image 在 Flash 上的起始偏移：jl_isd 缓冲区从 0 索引，
+        但其物理地址从 ISD_BASE 起，故取数据时用 image[addr-base]。
+        整片恢复时 base=0，行为与原先完全一致。
+        """
         if not plan_addrs:
             return True, []
         total = len(plan_addrs)
         t0 = time.time()
         for idx, addr in enumerate(plan_addrs, 1):
-            data = image[addr:addr + SECTOR]
+            data = image[addr - base:addr - base + SECTOR]
             ok = False
             for attempt in range(1, WRITE_RETRY + 1):
                 if self.write_sector(addr, data):
@@ -459,6 +513,46 @@ class Device:
             if fail:
                 self.log(f"    补刷失败 {len(fail)} 个扇区")
                 return False, fail
+        return False, None
+
+    def verify_isd(self, isd, rounds=3):
+        """jl_isd 窗口写后校验：只回读 ISD_BASE 起的 len(isd) 字节。
+
+        与整片 verify 的区别：校验范围被严格限制在一体化固件窗口内，
+        boot 区和其后的资源/字库区不参与，避免把“本就不写”的区域误判为差异。
+        不一致时按扇区自动补刷。返回 (成功?, 差异扇区列表 or None)。
+        """
+        end = ISD_BASE + len(isd)
+        for round_no in range(1, rounds + 1):
+            self.log("")
+            self.log(f"  写后校验（第 {round_no} 轮，窗口 "
+                     f"0x{ISD_BASE:X}-0x{end:X}）...")
+            rb = self.read_window(ISD_BASE, len(isd))
+            actual = hashlib.sha256(rb).hexdigest()
+            expect = hashlib.sha256(isd).hexdigest()
+            self.log(f"    回读 SHA256 : {actual}")
+            self.log(f"    目标 SHA256 : {expect}")
+            if actual == expect:
+                self.log("    [校验通过] 一体化固件窗口一致。")
+                return True, None
+
+            # 差异扇区以物理地址表示；read_window 返回值从 ISD_BASE 起，
+            # 故第 k 个扇区对应物理地址 ISD_BASE + k*SECTOR。
+            sector_count = (len(isd) + SECTOR - 1) // SECTOR
+            bad = [ISD_BASE + k * SECTOR for k in range(sector_count)
+                   if rb[k * SECTOR:(k + 1) * SECTOR]
+                   != isd[k * SECTOR:(k + 1) * SECTOR]]
+            self.log(f"    [校验失败] {len(bad)} 个扇区不一致")
+            if not bad:
+                self.log("    扇区级比对一致但哈希不同，疑似回读错位，不做补刷")
+                return False, None
+            if round_no == rounds:
+                return False, bad
+            self.log(f"    补刷 {len(bad)} 个差异扇区 ...")
+            ok, failed = self.write_plan(isd, bad, base=ISD_BASE)
+            if not ok:
+                self.log(f"    补刷失败，首个未完成扇区 0x{failed[0]:06X}")
+                return False, failed
         return False, None
 
     def reset(self):
@@ -534,6 +628,93 @@ def analyze(current, image, allow_loader_write=False):
         "to_write": to_write, "skipped_loader": skipped_loader,
         "identical": not diff,
     }
+
+
+def validate_isd(isd: bytes) -> tuple[bool, str | None]:
+    """校验 jl_isd 一体化固件是否可安全写入。返回 (ok, 错误信息)。
+
+    为什么要单独校验而不复用 validate_image：jl_isd 不是 1MB 整片镜像，
+    它只覆盖 ISD_BASE 起的应用窗口，因此判据是“扇区对齐 + 落在 Flash 内
+    + 头部魔数正确 + 非空白”，而不是长度恰为 1MB。
+    """
+    if not isd:
+        return False, "文件为空"
+    if len(isd) % SECTOR != 0:
+        return False, (f"文件大小 {len(isd)} 不是 {SECTOR} 字节的整数倍，"
+                       "无法按扇区对齐写入")
+    if ISD_BASE + len(isd) > FLASH_SIZE:
+        return False, (f"落盘范围 0x{ISD_BASE:X}-0x{ISD_BASE + len(isd):X} "
+                       f"超出 Flash 容量 0x{FLASH_SIZE:X}")
+    if isd[:len(ISD_MAGIC)] != ISD_MAGIC:
+        return False, ("文件头不是 jl_isd 魔数 "
+                       f"0x{ISD_MAGIC.hex()}，可能不是一体化固件")
+    # 只跳过头部魔数检查主体：防止“魔数正确但其余全空白”的损坏文件蒙混过关，
+    # 真实 jl_isd 的主体是加密段，绝不可能整片为 0xFF/0x00。
+    body = isd[len(ISD_MAGIC):]
+    if body and (body == b"\xff" * len(body) or body == b"\x00" * len(body)):
+        return False, "除头部魔数外全部为空白（0xFF/0x00），文件疑似损坏，拒绝写入"
+    return True, None
+
+
+def analyze_isd(window: bytes, isd: bytes) -> dict[str, object]:
+    """对比设备当前窗口与 jl_isd，生成写入计划。
+
+    window 为设备从 ISD_BASE 回读的内容，长度应与 isd 相同；isd 从 0 索引，
+    但输出的扇区地址统一换算为物理地址（ISD_BASE + k*SECTOR），这样后续
+    write_plan / verify_isd 拿到的地址可直接用于设备，无需再做换算。
+    """
+    blank = b"\xff" * SECTOR
+    same = 0
+    diff: list[int] = []
+    dev_blank: list[int] = []
+    bk_blank: list[int] = []
+    both: list[int] = []
+    sector_count = len(isd) // SECTOR
+    for k in range(sector_count):
+        start = k * SECTOR
+        device_sector = window[start:start + SECTOR]
+        target_sector = isd[start:start + SECTOR]
+        addr = ISD_BASE + start
+        if device_sector == target_sector:
+            same += 1
+            continue
+        diff.append(addr)
+        if device_sector == blank:
+            dev_blank.append(addr)
+        elif target_sector == blank:
+            bk_blank.append(addr)
+        else:
+            both.append(addr)
+
+    return {
+        "same": same,
+        "diff": diff,
+        "dev_blank": dev_blank,
+        "bk_blank": bk_blank,
+        "both": both,
+        "to_write": diff,          # 整个窗口都在应用区，无 loader 保护问题
+        "identical": not diff,
+        "sector_count": sector_count,
+    }
+
+
+def isd_risk_assessment(plan: Mapping[str, object]) -> tuple[str, list[str]]:
+    """评估刷写一体化固件的风险，返回 (等级 none/ok/warn/high, 提示列表)。"""
+    diff = plan["diff"]
+    if plan["identical"]:
+        return "none", ["设备固件窗口与 jl_isd 完全一致，无需写入"]
+
+    sector_count = int(plan["sector_count"])
+    warns = [
+        "本操作写入的是一体化固件（含加密 uboot/app），实质为【刷写/更换固件】，"
+        "boot 保护区(0x0-0x1000)与资源区不受影响",
+    ]
+    level = "warn"
+    if len(diff) / sector_count > 0.5:
+        warns.append(f"差异扇区占比 {len(diff) / sector_count * 100:.0f}%，"
+                     "写入范围较大")
+        level = "high"
+    return level, warns
 
 
 def firmware_identity(current, fw_dir, quiet=True):

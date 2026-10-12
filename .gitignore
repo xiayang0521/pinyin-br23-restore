@@ -31,3 +31,6 @@ env/
 *.swp
 .DS_Store
 Thumbs.db
+
+# ---- Inno Setup 打包产物（进 Release 资产，不进 git）----
+installer/output/

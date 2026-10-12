@@ -380,6 +380,27 @@ def pick_default_image():
     return out
 
 
+def find_isd_candidates() -> list[Path]:
+    """查找附近的 jl_isd.bin 一体化固件，去重后返回。
+
+    搜索范围：程序目录、固件包、上级目录（递归）。之所以递归到上级目录，
+    是因为 SDK 构建产物 jl_isd.bin 常位于 dist/firmware 等深层子目录，
+    限定在单层目录会找不到；用 rglob 递归可同时覆盖这些常见摆放位置。
+    """
+    roots = [APP_DIR]
+    fw = find_fw_package_dir()
+    if fw:
+        roots.append(fw)
+    roots.append(APP_DIR.parent)
+
+    candidates: list[Path] = []
+    for root in dict.fromkeys(roots):
+        if root.is_dir():
+            candidates.extend(root.rglob("jl_isd.bin"))
+    unique = sorted(set(candidates))
+    return [p for p in unique if p.is_file()]
+
+
 def op_precheck():
     """功能 4：只读预检（可选镜像对比）"""
     head("功能 4　只读预检（不写入）")
@@ -572,6 +593,163 @@ def op_restore():
         dev.close()
 
 
+def print_isd_report(window: bytes, isd: bytes, plan: dict,
+                     image_path: Path) -> None:
+    """打印 jl_isd 刷写预检报告（只读，不修改设备）。"""
+    sub("刷写预检报告（一体化固件）")
+    log(f"  目标文件       : {image_path}")
+    log(f"  文件大小       : {len(isd):,} 字节")
+    log(f"  目标 SHA256    : {br23core.sha256(isd)}")
+    log(f"  设备窗口 SHA256: {br23core.sha256(window)}")
+    log("")
+    total = int(plan["sector_count"])
+    log(f"  落盘窗口       : 0x{br23core.ISD_BASE:X} - "
+        f"0x{br23core.ISD_BASE + len(isd):X}（仅 {len(isd) // 1024} KB）")
+    log(f"  4KB 扇区统计   : 共 {total} | 一致 {plan['same']} | "
+        f"不同 {len(plan['diff'])}")
+    if plan["diff"]:
+        log(f"    设备空白/文件有内容 : {len(plan['dev_blank'])}")
+        log(f"    设备有/文件空白     : {len(plan['bk_blank'])}")
+        log(f"    双方有数据但不同     : {len(plan['both'])}")
+    log("")
+    log("  boot 区 0x0-0x1000 与资源区：本次不读取、不擦写，保持原样。")
+    log("")
+    if plan["diff"]:
+        log("  差异区间:")
+        for s, e in br23core.compress_ranges(plan["diff"]):
+            log(f"    0x{s:06X} - 0x{e - 1:06X}  ({(e - s) // 1024:4d} KB)")
+        log("")
+    log(f"  预计写入扇区数 : {len(plan['to_write'])} / {total}")
+    log("")
+
+
+def op_flash_isd() -> int:
+    """功能 5：刷写 jl_isd.bin 一体化固件。
+
+    流程：选文件 → 校验 → 连接 → 只读窗口预检 → 存回滚快照(整片) →
+    确认 → 写入 → 窗口校验 → 复位。任何失败都不复位设备，便于用户补救。
+    """
+    head("功能 5　刷写 jl_isd.bin 一体化固件")
+    log("")
+    log("  本功能把杰理一体化固件写入 Flash 的 0x1000 起应用窗口。")
+    log("  流程：预检 → 你确认 → 写入 → 窗口校验 → 复位。")
+    log("")
+
+    candidates = find_isd_candidates()
+    if not candidates:
+        log("[错误] 附近没找到 jl_isd.bin。")
+        log("       请把构建产物放到本程序目录（或上级目录）后再试。")
+        return 1
+
+    shown = candidates[:10]
+    log("  可用文件：")
+    for i, path in enumerate(shown, 1):
+        log(f"    {i}. {path}   ({path.stat().st_size:,} 字节)")
+    log("")
+    try:
+        idx = int(input("  请选择要刷写的文件序号 [1]: ").strip() or "1")
+    except (ValueError, EOFError, KeyboardInterrupt):
+        log("")
+        log("已取消。")
+        return 130
+    if not (1 <= idx <= len(shown)):
+        log("序号无效，已取消。")
+        return 130
+    image_path = shown[idx - 1]
+
+    isd = image_path.read_bytes()
+    ok, err = br23core.validate_isd(isd)
+    if not ok:
+        log(f"[错误] 文件不可用: {err}")
+        return 1
+
+    dev = connect_device()
+    if dev is None:
+        return 1
+
+    try:
+        log("")
+        ok, _info = dev.read_info()
+        if not ok:
+            log("[错误] 设备信息读取失败，中止（未做任何写入）。")
+            return 2
+
+        # 只回读一体化固件窗口：比读整片 1MB 更快，也明确表达“只动这段”。
+        window = dev.read_window(br23core.ISD_BASE, len(isd))
+        plan = br23core.analyze_isd(window, isd)
+        print_isd_report(window, isd, plan, image_path)
+
+        if plan["identical"]:
+            sub("无需写入")
+            log("  设备固件窗口与 jl_isd 完全一致，未做任何写入。")
+            return 0
+
+        # 回滚快照存“整片 1MB”，因为刷机后若异常，需要整片镜像才能完整恢复。
+        SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        snap = SNAPSHOT_DIR / ("snapshot_%s.bin"
+                               % datetime.now().strftime("%Y%m%d_%H%M%S"))
+        log("  正在保存整片回滚快照（约 1MB，只读）...")
+        snap.write_bytes(dev.read_flash())
+        log(f"  回滚快照: {snap}")
+
+        level, warns = br23core.isd_risk_assessment(plan)
+        sub("风险评估")
+        tag = {"none": "无", "ok": "低", "warn": "中", "high": "高"}[level]
+        log(f"  风险等级：{tag}")
+        for w in warns:
+            log(f"  ! {w}")
+        log("")
+        log(f"  将写入 {len(plan['to_write'])} 个 4KB 扇区"
+            f"（{len(plan['to_write']) * 4096:,} 字节）。")
+        log("  回滚方式：若刷写后异常，可用「功能 2 恢复固件」选择该整片快照恢复。")
+        log("")
+        if not ask_confirm_danger("  确认刷写？请输入 YES 继续（其它输入均取消）："):
+            log("")
+            log("  已取消，未做任何写入。")
+            return 130
+
+        head("正在写入")
+        ok, failed = dev.write_plan(isd, plan["to_write"],
+                                    base=br23core.ISD_BASE)
+        if not ok:
+            log("")
+            log(f"[写入失败] 从扇区 0x{failed[0]:06X} 起未完成。")
+            log("           设备保持 UBOOT 状态，未复位。")
+            log(f"           可用回滚快照恢复: {snap}")
+            return 4
+
+        head("写后校验")
+        ok, bad = dev.verify_isd(isd)
+        if not ok:
+            log("")
+            log("[校验失败] 一体化固件窗口与文件不一致。")
+            if bad:
+                log(f"         差异扇区 {len(bad)} 个，首个 0x{bad[0]:06X}")
+            log("         设备保持 UBOOT 状态，未复位。")
+            log(f"         可用回滚快照恢复: {snap}")
+            return 5
+
+        head("完成")
+        log("  一体化固件已写入并通过窗口 SHA256 校验。")
+        log(f"  回滚快照: {snap}")
+        log("")
+        dev.reset()
+        log("  设备应已自动重启进入正常模式。")
+        return 0
+
+    except KeyboardInterrupt:
+        log("")
+        log("[已中断] 设备未复位。若已开始写入，请先用预检确认状态。")
+        return 130
+    except Exception as e:
+        log("")
+        log(f"[异常] {type(e).__name__}: {e}")
+        log("        设备未复位。若已开始写入，请先用预检确认状态。")
+        return 6
+    finally:
+        dev.close()
+
+
 def op_device_info():
     """功能 3：查看设备信息（只读）"""
     head("功能 3　查看设备信息（只读）")
@@ -634,6 +812,7 @@ MENU = """
   2. 恢复固件          预检 → 确认 → 写入 → 校验 → 复位
   3. 查看设备信息      进 UBOOT 看芯片与固件信息（只读）
   4. 只读预检          只分析不写入，看清恢复会做什么
+  5. 刷写 jl_isd.bin   把一体化固件写入 0x1000 起应用窗口
   0. 退出
 """
 
@@ -642,6 +821,7 @@ OPS = {
     "2": op_restore,
     "3": op_device_info,
     "4": op_precheck,
+    "5": op_flash_isd,
 }
 
 
