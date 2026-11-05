@@ -11,6 +11,8 @@ on:
   push:
     tags:
       - "v*"
+    branches:
+      - "actions-trigger-test"
   workflow_dispatch:
 
 permissions:
