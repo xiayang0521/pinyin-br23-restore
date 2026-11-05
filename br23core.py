@@ -218,6 +218,37 @@ class Device:
             time.sleep(0.5)
         return None
 
+    def enter_uboot(self, timeout=40):
+        """只把设备引导进 UBOOT1.00：扫描 → 必要时软触发 → 等待重枚举。
+        不上传 loader、不做任何读写。返回 (ok, entry or None)"""
+        self.log("  扫描磁盘设备 ...")
+        entries = self.scan(verbose=True)
+        if not entries:
+            self.log("  [错误] 未发现任何 JL 设备。请检查 USB 线是否插好、设备是否开机。")
+            return False, None
+
+        uboot = next((e for e in entries if e["product"] == "UBOOT1.00"), None)
+        if uboot:
+            self.log("  设备已在 UBOOT 模式，无需操作。")
+            return True, uboot
+
+        fwmode = next((e for e in entries if e["product"] in ("UDISK", "DEVICE")), None)
+        if fwmode is None:
+            self.log("  [错误] 发现的 JL 设备均非 BR23：")
+            for e in entries:
+                self.log(f"          {e['path']} -> {e['vendor']} | {e['product']} | {e['rev']}")
+            return False, None
+
+        self.log(f"  设备处于固件 USB 模式（{fwmode['vendor']} {fwmode['product']}），软触发进 UBOOT ...")
+        if not self.soft_trigger(fwmode):
+            self.log("  [错误] 进入 UBOOT 命令发送失败")
+            return False, None
+        uboot = self.wait_uboot(timeout)
+        if uboot is None:
+            self.log(f"  [错误] {timeout} 秒内未以 UBOOT1.00 重新枚举")
+            return False, None
+        return True, uboot
+
     # ---------------- 起 loader ----------------
 
     def connect(self, require_uboot=False):

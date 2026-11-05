@@ -10,7 +10,8 @@ BR23 拼音机固件备份 / 恢复工具
   1. 备份固件    —— 读取设备整片 1MB Flash 存成 .bin
   2. 恢复固件    —— 只读预检 → 人工确认 → 写入 → 校验 → 复位
   3. 查看设备信息 —— 进 UBOOT 并显示芯片/固件信息（只读）
-  4. 只读预检    —— 只分析不写入，看清恢复会做���么
+  4. 只读预检    —— 只分析不写入，看清恢复会做什么
+  6. 进入 UBOOT  —— 让设备复位停在 UBOOT1.00，配合杰理烧录工具刷机
   0. 退出
 
 无需管理员权限，无需 Pico 硬件。
@@ -805,6 +806,54 @@ def op_device_info():
         log("  设备仍处于 UBOOT 模式。断电重新上电可回到正常模式。")
 
 
+def op_enter_uboot():
+    """功能 6：进入 UBOOT 模式（只引导，不上传 loader、不读写）
+
+    用途：让设备复位并停留在 UBOOT1.00，之后可配合杰理烧录工具
+    （isd_download）连接刷机；断电重新上电即可回到正常模式。
+    """
+    head("功能 6　进入 UBOOT 模式")
+    log("")
+    log("  本功能让设备复位进入 UBOOT1.00 模式并停在那里，不做任何读写。")
+    log("  之后可用杰理烧录工具（isd_download）连接设备进行刷机。")
+    log("  断电重新上电即可退出 UBOOT 回到正常模式。")
+    log("")
+
+    tool = find_tool_dir()
+    if tool is None:
+        log("[错误] 找不到 jl-uboot-tool 组件，无法工作。")
+        log("       请确认 exe 完整（_internal 目录是否齐全）。")
+        return 1
+    try:
+        mods = br23core.bind_modules(tool)
+    except Exception as e:
+        log(f"[错误] 加载组件失败: {type(e).__name__}: {e}")
+        return 1
+
+    dev = br23core.Device(mods, log, logfile=TERM.fp)
+    try:
+        ok, entry = dev.enter_uboot()
+        if not ok:
+            return 1
+        log("")
+        sub("完成")
+        log(f"  设备已进入 UBOOT1.00: {entry['path']}")
+        log(f"    厂商/产品: {entry['vendor']} / {entry['product']} {entry['rev']}")
+        log("")
+        log("  现在可以运行杰理烧录工具刷机。")
+        log("  注意：断电重新上电会退出 UBOOT，需重新执行本功能。")
+        return 0
+    except KeyboardInterrupt:
+        log("")
+        log("[已中断]")
+        return 130
+    except Exception as e:
+        log(f"[错误] {type(e).__name__}: {e}")
+        return 3
+    finally:
+        dev.close()
+
+
 # ---------------------------------------------------------------- 菜单
 
 MENU = """
@@ -813,6 +862,7 @@ MENU = """
   3. 查看设备信息      进 UBOOT 看芯片与固件信息（只读）
   4. 只读预检          只分析不写入，看清恢复会做什么
   5. 刷写 jl_isd.bin   把一体化固件写入 0x1000 起应用窗口
+  6. 进入 UBOOT        让设备复位停在 UBOOT1.00（配合杰理烧录工具刷机）
   0. 退出
 """
 
@@ -822,6 +872,7 @@ OPS = {
     "3": op_device_info,
     "4": op_precheck,
     "5": op_flash_isd,
+    "6": op_enter_uboot,
 }
 
 
