@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import br23core
 
 APP_NAME = "BR23 拼音机固件工具"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 
 # ---------------------------------------------------------------- 路径定位
 
